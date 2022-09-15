@@ -5,7 +5,7 @@ import numpy as np
 from numpy import newaxis as na
 import abc
 import copy
-from scipy.special import logsumexp
+from scipy.misc import logsumexp
 
 from pyhsmm.util.stats import sample_discrete
 try:
@@ -21,11 +21,12 @@ from pyhsmm.util.general import rle
 class _StatesBase(with_metaclass(abc.ABCMeta, object)):
 
     def __init__(self,model,T=None,data=None,stateseq=None,
-            generate=True,initialize_from_prior=True, fixed_stateseq=False):
+            generate=True,initialize_from_prior=True, fixed_stateseq=False, timepoint=0):
         self.model = model
 
         self.T = T if T is not None else data.shape[0]
         self.data = data
+        self.timepoint = timepoint
 
         self.clear_caches()
 
@@ -100,7 +101,10 @@ class _StatesBase(with_metaclass(abc.ABCMeta, object)):
 
             aBl = self._aBl = np.empty((data.shape[0],self.num_states))
             for idx, obs_distn in enumerate(self.obs_distns):
-                aBl[:,idx] = obs_distn.log_likelihood(data).ravel()
+                if self.model.var_prior is None:
+                    aBl[:,idx] = obs_distn.log_likelihood(data).ravel()
+                else:
+                    aBl[:,idx] = obs_distn.log_likelihood(data, self.timepoint).ravel()
             aBl[np.isnan(aBl).any(1)] = 0.
 
         return self._aBl

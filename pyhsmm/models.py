@@ -11,7 +11,8 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 from matplotlib import cm
 from warnings import warn
-from scipy.special import logsumexp
+from scipy.misc import logsumexp
+from scipy.stats import invgamma, chi2
 
 from pyhsmm.basic.abstractions import Model, ModelGibbsSampling, \
     ModelEM, ModelMAPEM, ModelMeanField, ModelMeanFieldSVI, ModelParallelTempering
@@ -30,16 +31,19 @@ from pybasicbayes.distributions.gaussian import Gaussian
 class _HMMBase(Model):
     _states_class = hmm_states.HMMStatesPython
     _trans_class = transitions.HMMTransitions
-    _trans_conc_class = transitions.HMMTransitionsConc
-    _init_state_class = initial_state.HMMInitialState
+    _trans_conc_class = transitions.HMMTransitionsConc # conc stands for concentration, here the concentration is also inferred
+    _init_state_class = initial_state.HMMInitialState  # Changed HMMInitialState -> UniformInitialState
 
     def __init__(self,
             obs_distns,
             trans_distn=None,
             alpha=None,alpha_a_0=None,alpha_b_0=None,trans_matrix=None,
-            init_state_distn=None,init_state_concentration=None,pi_0=None):
+            init_state_distn=None,init_state_concentration=None,pi_0=None,
+            var_prior=None):
         self.obs_distns = obs_distns
         self.states_list = []
+        self.timepoint = -1
+        self.var_prior = var_prior
 
         if trans_distn is not None:
             self.trans_distn = trans_distn
@@ -159,6 +163,31 @@ class _HMMBase(Model):
 
         return outs
 
+    def delete_data(self):
+        for s in self.states_list:
+            s.data = None
+
+    def delete_obs_data(self):
+        for o in self.obs_distns:
+            o.sigma_k = None
+            o.sigma_k_k_minus = None
+            o.gain_save = None
+            o.x_hat_k = None
+            o.x_hat_k_k_minus = None
+            o.R = None
+            o.pseudo_obs = None
+            o.H = None
+            o.pseudo_Q = None
+
+    def delete_dur_data(self):
+        for d in self.dur_distns:
+            d.r_support = None
+            d.r_probs = None
+            d.rho_0 = None
+            d.rho_mf = None
+            d.p_save = d.p
+            d._fixedr_distns = None  # can't access p of the overall dist if I delete this. But if need be I could probs delete the prior of these dists
+
     @property
     def stateseqs(self):
         return [s.stateseq for s in self.states_list]
@@ -192,8 +221,8 @@ class _HMMBase(Model):
         for s in self.states_list:
             for state in s.stateseq:
                 canonical_ids[state]
-        return list(map(operator.itemgetter(0),
-                sorted(canonical_ids.items(),key=operator.itemgetter(1))))
+        return map(operator.itemgetter(0),
+                sorted(canonical_ids.items(),key=operator.itemgetter(1)))
 
     @property
     def state_usages(self):
@@ -448,8 +477,24 @@ class _HMMGibbsSampling(_HMMBase,ModelGibbsSampling):
         self.resample_init_state_distn()
 
     def resample_obs_distns(self):
-        for state, distn in enumerate(self.obs_distns):
-            distn.resample([s.data[s.stateseq == state] for s in self.states_list])
+        if self.var_prior is None:
+            for state, distn in enumerate(self.obs_distns):
+                distn.resample([s.data[s.stateseq == state] for s in self.states_list])
+        else:
+            psi_diffs = []
+            for state, distn in enumerate(self.obs_distns):
+                distn.resample([s.data[s.stateseq == state] for s in self.states_list])
+                psi_diffs.append(distn.psi_diff_saves)
+
+            if self.var_prior == 'uniform':
+                # resample sigma squared of the dynamic distributions
+                diffs = np.concatenate(psi_diffs)
+                fraction = np.sum(diffs ** 2) / 2
+                # sigmasq_states = invgamma.rvs(self.obs_distns[0].sigma_alpha + diffs.size / 2, scale=self.obs_distns[0].sigma_beta + fraction)
+                sigmasq_states = 2 * fraction / chi2(diffs.size - 1).rvs()  # uniform prior, see Gelman (p.598, tau update)
+                for distn in self.obs_distns:
+                    distn.sigmasq_states = sigmasq_states
+
         self._clear_caches()
 
     @line_profiled
@@ -671,8 +716,12 @@ class _HMMEM(_HMMBase,ModelEM):
         # approximation!)
         assert data is None and len(self.states_list) > 0, 'Must have data to get BIC'
         if data is None:
-            return -2*sum(self.log_likelihood(s.data).sum() for s in self.states_list) + \
-                        self.num_parameters() * np.log(
+            # return -2*sum(self.log_likelihood(s.data).sum() for s in self.states_list) + \
+            #             self.num_parameters() * np.log(
+            #                     sum(s.data.shape[0] for s in self.states_list))
+            # I changed this ! SAB
+            return -2*sum(s.log_likelihood().sum() for s in self.states_list) + \
+                        self.num_parameters * np.log(
                                 sum(s.data.shape[0] for s in self.states_list))
         else:
             return -2*self.log_likelihood(data) + self.num_parameters() * np.log(data.shape[0])
@@ -898,6 +947,7 @@ class _HSMMBase(_HMMBase):
 
     def add_data(self,data,stateseq=None,trunc=None,
             right_censoring=True,left_censoring=False,**kwargs):
+        self.timepoint += 1
         self.states_list.append(self._states_class(
             model=self,
             data=np.asarray(data),
@@ -905,6 +955,7 @@ class _HSMMBase(_HMMBase):
             right_censoring=right_censoring,
             left_censoring=left_censoring,
             trunc=trunc,
+            timepoint=self.timepoint,
             **kwargs))
         return self.states_list[-1]
 
@@ -1393,4 +1444,3 @@ class WeakLimitHDPHSMMTruncatedIntNegBinSeparateTrans(
         _SeparateTransMixin,
         WeakLimitHDPHSMMTruncatedIntNegBin):
     _states_class = hsmm_inb_states.HSMMStatesTruncatedIntegerNegativeBinomialSeparateTrans
-

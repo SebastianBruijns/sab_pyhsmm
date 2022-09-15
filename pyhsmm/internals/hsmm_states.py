@@ -2,10 +2,13 @@ from __future__ import division
 from builtins import range, map
 import numpy as np
 from numpy import newaxis as na
-from scipy.special import logsumexp
+from scipy.misc import logsumexp
 
 from pyhsmm.util.stats import sample_discrete
 from pyhsmm.util.general import rle, rcumsum, cumsum
+import random
+import time
+import pickle
 
 from . import hmm_states
 from .hmm_states import _StatesBase, _SeparateTransMixin, \
@@ -14,7 +17,7 @@ from .hmm_states import _StatesBase, _SeparateTransMixin, \
 
 class HSMMStatesPython(_StatesBase):
     def __init__(self,model,right_censoring=True,left_censoring=False,trunc=None,
-            stateseq=None,**kwargs):
+            stateseq=None, timepoint=0,**kwargs):
         self.right_censoring = right_censoring
         self.left_censoring = left_censoring
         self.trunc = trunc
@@ -23,7 +26,7 @@ class HSMMStatesPython(_StatesBase):
             self._kwargs,trunc=trunc,
             left_censoring=left_censoring,right_censoring=right_censoring)
 
-        super(HSMMStatesPython,self).__init__(model,stateseq=stateseq,**kwargs)
+        super(HSMMStatesPython,self).__init__(model,stateseq=stateseq,timepoint=timepoint,**kwargs)
 
     ### properties for the outside world
 
@@ -501,12 +504,40 @@ class HSMMStatesEigen(HSMMStatesPython):
         # NOTE: np.maximum calls are because the C++ code doesn't do
         # np.logaddexp(-inf,-inf) = -inf, it likes nans instead
         from pyhsmm.internals.hsmm_messages_interface import messages_backwards_log
-        betal, betastarl = messages_backwards_log(
-                np.maximum(self.trans_matrix,1e-50),self.aBl,np.maximum(self.aDl,-1000000),
-                self.aDsl,np.empty_like(self.aBl),np.empty_like(self.aBl),
-                self.right_censoring,self.trunc if self.trunc is not None else self.T)
+        # aBl are emission log probs, aDl are log likelihoods of durations,
+        # aDsl are log probs of survival func of durations
+        # print()
+        # a = time.time()
+        # !!! trans_mat is not logged !!!
+        betal, betastarl = messages_backwards_log(np.maximum(self.trans_matrix, 1e-50), self.aBl,
+                                                  np.maximum(self.aDl, -1000000), self.aDsl,
+                                                  np.empty_like(self.aBl), np.empty_like(self.aBl),
+                                                  self.right_censoring, self.trunc if self.trunc is not None else self.T)
+        # print(time.time() - a)
         assert not np.isnan(betal).any()
         assert not np.isnan(betastarl).any()
+
+        """print('abl') # proof that betastarl[-1] == self.aBl[-1]
+        print(betastarl[-1] - self.aBl[-1])"""
+
+
+        # code to see that my python message passer works
+        # a = time.time()
+        # my_betal, my_betastarl = self.my_messages_backwards_log(
+        #         np.maximum(self.trans_matrix,1e-50), self.aBl, np.maximum(self.aDl,-1000000), self.aDsl)
+        # print(time.time() - a)
+
+        # print('diffs')
+        # print(np.sum( np.abs(betal - my_betal)))
+        # print(np.sum( np.abs(betastarl - my_betastarl)))
+        #
+        # my_var = 52
+        # print(betal[- my_var])
+        # print(betastarl[- my_var])
+        #
+        # print(my_betal[- my_var])
+        # print(my_betastarl[- my_var])
+
 
         if not self.left_censoring:
             self._normalizer = logsumexp(np.log(self.pi_0) + betastarl[0])
@@ -515,18 +546,67 @@ class HSMMStatesEigen(HSMMStatesPython):
 
         return betal, betastarl
 
+    def my_messages_backwards_log(self, trans_mat, log_obs, log_durs, log_survivals):
+        betal = np.zeros_like(log_obs) # 0's here are important because of += later
+        betastarl = np.zeros_like(log_obs)
+        betal[-1] = 1
+        betastarl[-1] = np.exp(log_obs[-1]) # empirical fact, might be censoring term -> I get it myself to, comes from marginalisation of all durations since survival func
+        S = betal.shape[1]
+        T = betal.shape[0]
+
+
+        #print(np.exp(log_durs[1]) + np.exp(log_durs[0]) + np.exp(log_survivals[1])) # this is how it works
+
+        for t in range(T - 1, 0, -1):
+            for i in range(S):
+                temp = 0
+                for d in range(1, T - t + 1):
+                    temp += betal[t + d - 1, i] * np.exp(log_durs[d - 1, i]) * np.prod(np.exp(log_obs[t:t + d, i])) # durs might start at 1
+
+                temp += np.exp(log_survivals[T - t - 1, i]) * np.prod(np.exp(log_obs[t:, i])) # depends on coding of sf
+                betastarl[t, i] = temp
+
+            for i in range(S):
+                for j in range(S):
+                    betal[t - 1, i] += betastarl[t, j] * trans_mat[i, j]
+
+        # one last time, to fill last row o fbetastarl
+        t = 0
+        for i in range(S):
+            temp = 0
+            for d in range(1, T - t + 1):
+                temp += betal[t + d - 1, i] * np.exp(log_durs[d - 1, i]) * np.prod(np.exp(log_obs[t:t + d, i])) # durs might start at 1
+
+            temp += np.exp(log_survivals[T - t - 1, i]) * np.prod(np.exp(log_obs[t:, i])) # depends on coding of sf
+            betastarl[t, i] = temp
+
+        return np.log(betal), np.log(betastarl)
+
     def messages_backwards_python(self):
         return super(HSMMStatesEigen,self).messages_backwards()
 
     def sample_forwards(self,betal,betastarl):
-        from pyhsmm.internals.hsmm_messages_interface import sample_forwards_log
+        # from pyhsmm.internals.hsmm_messages_interface import sample_forwards_log
         if self.left_censoring:
             raise NotImplementedError
         caBl = np.vstack((np.zeros(betal.shape[1]),np.cumsum(self.aBl[:-1],axis=0)))
-        self.stateseq = sample_forwards_log(
-                self.trans_matrix,caBl,self.aDl,self.pi_0,betal,betastarl,
-                np.empty(betal.shape[0],dtype='int32'))
-        assert not (0 == self.stateseq).all()
+
+        # self.stateseq = sample_forwards_log(
+        #         self.trans_matrix,caBl,self.aDl,self.pi_0,betal,betastarl,
+        #         np.empty(betal.shape[0],dtype='int32'))
+
+        temp_a = self.trans_matrix
+        temp_b = caBl
+        temp_c = self.aDl
+        temp_d = self.pi_0
+        temp_e = betal
+        temp_f = betastarl
+        temp_g = np.empty(betal.shape[0], dtype='int32')
+        temp = (temp_a, temp_b, temp_c, temp_d, temp_e, temp_f, temp_g)
+
+        tempali = sample_forwards_log_mypy(*temp)
+        self.stateseq = tempali
+        # assert not (0 == self.stateseq).all()
 
     def sample_forwards_python(self,betal,betastarl):
         return super(HSMMStatesEigen,self).sample_forwards(betal,betastarl)
@@ -994,7 +1074,6 @@ def hsmm_messages_backwards_log(
     betal[-1] = 0.
     for t in range(T-1,-1,-1):
         cB, offset = cumulative_obs_potentials(t)
-        dp = dur_potentials(t)
         betastarl[t] = logsumexp(
             betal[t:t+cB.shape[0]] + cB + dur_potentials(t), axis=0)
         betastarl[t] -= offset
@@ -1131,3 +1210,99 @@ def hsmm_maximizing_assignment(
 
     return stateseq
 
+
+def sample_forwards_log_myc(trans_matrix, caBl, aDl, pi_0, betal, betastarl, irrev):
+    t = 0
+    T, limit_n = betal.shape
+    nextstate_distr = pi_0
+    stateseq = np.empty(T, dtype=np.int32)
+
+    while t < T:
+        logdomain = betastarl[t] - betastarl[t].max()
+        nextstate_distr *= np.exp(logdomain)
+        if (nextstate_distr == 0.).all():
+            print("Warning: all-zero posterior state belief, following likelihood")
+            nextstate_distr = np.exp(logdomain)
+
+        # sample_discrete behaves weirdly, doesn't need normalization?
+        # https://www.sidefx.com/docs/houdini/vex/functions/sample_discrete.html
+        # seems to work fine
+        state = np.random.choice(limit_n, p=nextstate_distr / nextstate_distr.sum())
+
+        durprob = random.random()
+        dur = 0
+        while durprob > 0. and t + dur < T:
+            p_d_prior = np.exp(aDl[dur, state])
+            if 0.0 == p_d_prior:
+                dur += 1
+                continue
+
+            p_d = p_d_prior * np.exp(caBl[t+dur+1, state] - caBl[t, state] + betal[t+dur, state] - betastarl[t, state])
+            durprob -= p_d
+            dur += 1
+
+        stateseq[t: t + dur] = state
+        t += dur
+        nextstate_distr = trans_matrix[state]
+
+
+def sample_forwards_log_mypy(trans_matrix, caBl, aDl, pi_0, betal, betastarl, irrev):
+    # Does Matt rely on no impossible observations, since he uses the cumulative obs?
+    T, limit_n = betal.shape
+    stateseq = np.empty(T, dtype=np.int32)
+
+    assert np.allclose(np.sum(pi_0), 1)
+    assert np.allclose(np.sum(trans_matrix, axis=1), np.ones(limit_n))  # not quite clear why this all_close is necessary here
+
+    total_dur = 0
+    current_state = None
+    # TODO: do I end sequence at right time?
+    while total_dur < T:
+        # this was previously done in a try except, with the except hitting if the attempted normalisation fails. Now we do it always, should give more precision (mostly negligible)
+        # also the except clause modified betastarl, causing a bug later on
+        temp_beta_potential = betastarl[total_dur] - np.max(betastarl[total_dur])
+        state_dist_un = trans_matrix[current_state] * np.exp(temp_beta_potential) if total_dur != 0 else pi_0 * np.exp(temp_beta_potential)
+        state_dist = state_dist_un / np.sum(state_dist_un)
+
+        next_state = np.random.choice(limit_n, p=state_dist)
+
+        # old duration drawing code, not as efficient as it always generates the entire probability vector
+        # temp = np.zeros(T - total_dur)  # generate one extra, for 1 - P(staying within T)
+        # for d in range(T - total_dur - 1):
+        #     temp[d] += aDl[d, next_state]
+        #     temp[d] += caBl[total_dur + d + 1, next_state] - caBl[total_dur, next_state]
+        #     temp[d] += betal[total_dur + d, next_state]  # no + 1 here, B goes from 1 (-> 0) to T (-> T-1)
+        # temp[:-1] -= betastarl[total_dur, next_state]
+        # temp[:-1] = np.exp(temp[:-1])  # TODO: but weird that we have to do -2 here, why skip 2?
+        # temp[-1] = max(0, 1 - np.sum(temp))  # cap at 0, don't let negativity intrude, TODO: let diff not be to big
+        # sample_dur = np.random.choice(T - total_dur, p=temp) + 1
+        # this bit of code actually does the same as random.choice, pretty neat
+        # # d = 0
+        # # durprob = np.random.rand()
+        # # while durprob > 0.:
+        # #     durprob -= temp[d]
+        # #     d += 1
+        # # sample_dur = d
+
+        d = 0
+        durprob = np.random.rand()
+        while durprob > 0. and total_dur + d < T - 1:
+            p_d_prior = np.exp(aDl[d, next_state])
+            if 0.0 == p_d_prior:
+                d += 1
+                continue
+
+            p_d = p_d_prior * np.exp(caBl[total_dur + d + 1, next_state]
+                            - caBl[total_dur, next_state] + betal[total_dur + d, next_state]
+                            - betastarl[total_dur, next_state])
+            durprob -= p_d
+            d += 1
+        sample_dur = d
+        if total_dur + d == T - 1 and durprob > 0.:
+            sample_dur += 1
+
+        stateseq[total_dur: min(total_dur + sample_dur, T)] = next_state  # I really want to go till end of array, no self.T - 1 in min
+        total_dur += sample_dur
+        current_state = next_state
+
+    return stateseq

@@ -213,10 +213,12 @@ class _HSMMTransitionsGibbs(_HSMMTransitionsBase,_HMMTransitionsGibbs):
 
         if trans_counts.sum() > 0:
             froms = trans_counts.sum(1)
-            self_trans = [np.random.geometric(1-A_ii,size=n).sum() if n > 0 else 0
+            # big change here, SAB!!!
+            self_trans = [min(50000, np.random.geometric(1-A_ii,size=n).sum() if n > 0 else 0)
                     for A_ii, n in zip(self.full_trans_matrix.diagonal(),froms)]
             trans_counts += np.diag(self_trans)
 
+        #print("trans_counts {}".format(trans_counts.max()))
         return trans_counts
 
 class _HSMMTransitionsMaxLikelihood(_HSMMTransitionsBase,_HMMTransitionsMaxLikelihood):
@@ -581,4 +583,3 @@ class _DATruncHDPHSMMTransitionsSVI(_DATruncHDPHMMTransitionsSVI,_HSMMTransition
 
 class DATruncHDPHSMMTransitions(_DATruncHDPHSMMTransitionsSVI):
     pass
-

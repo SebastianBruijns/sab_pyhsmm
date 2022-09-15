@@ -8,7 +8,7 @@ from pyhsmm.basic.abstractions import GibbsSampling, MaxLikelihood
 from pyhsmm.basic.distributions import Categorical
 
 class UniformInitialState(object):
-    def __init__(self,model):
+    def __init__(self,model,init_state_concentration=None,pi_0=None):  # Changed, swallow these arguments
         self.model = model
 
     @property
