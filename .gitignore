@@ -1,5 +1,6 @@
 *.pyc
 *.pyo
+*.npy
 /tags
 /.tags
 *.lprof
@@ -8,3 +9,7 @@
 *.o
 deps/
 tests/figures
+*test*
+session_data/
+consistency_data/
+dynamic_GLMiHMM_consistency.py
