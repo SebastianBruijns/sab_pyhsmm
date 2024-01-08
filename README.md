@@ -6,13 +6,13 @@ This is an edit to the existing pyhsmm package by [Matt Johnson](https://github.
 Install together with sab_pybasicbayes like this:
 
 ```python
-conda create -n hdp_env_test python=3.7 pip numpy scipy matplotlib cython nose future requests 
-conda activate hdp_env_test
+conda create -n hdp_env python=3.7 pip numpy scipy matplotlib cython nose future requests 
+conda activate hdp_env
 
 pip install pypolyagamma
 
-pip install git+ssh://git@gitlab.tuebingen.mpg.de/agpd/sab_pybasicbayes.git
-pip install git+ssh://git@gitlab.tuebingen.mpg.de/agpd/sab_pyhsmm.git
+pip install git+https://github.com/SebastianBruijns/sab_pybasicbayes.git
+pip install git+https://github.com/SebastianBruijns/sab_pyhsmm.git
 ```
 
 # Bayesian inference in HSMMs and HMMs #
